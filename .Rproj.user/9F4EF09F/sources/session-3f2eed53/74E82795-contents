@@ -1,0 +1,50 @@
+setwd("C:/Users/LENOVO/metilazione_vera/matrici_tcga")
+
+library(gprofiler2)
+library(ggplot2)
+library(dplyr)
+
+gene_list <- readLines("up_list.txt")
+name_results <- "up_results.tsv"
+
+gost_results <- gost(
+  query = gene_list,      
+  organism = "hsapiens",
+  sources = c("KEGG", "REAC", "WP") 
+)
+
+gost_results$result
+
+# Rimuovi la colonna parents dal data frame poiché è in forma di lista e impedisce il salvataggio del tsv
+gost_results_clean <- gost_results$result[, !names(gost_results$result) %in% "parents"]
+write.table(gost_results_clean, file = name_results, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+gostplot(gost_results, capped = FALSE)
+
+#grafico a barre dei risultati:
+
+df <- gost_results[["result"]]
+
+# Crea una nuova colonna con -log10(p_value)
+df <- df %>%
+  mutate(neg_log10_pval = -log10(p_value))
+
+# Ordina per significatività (più significativa = barra più alta)
+df <- df %>%
+  arrange(desc(neg_log10_pval)) %>%
+  # Prendi i primi 20 pathway più significativi
+  slice(1:20)
+
+# Imposta l'ordine dei termini per il plot
+df$term_name <- factor(df$term_name, levels = rev(df$term_name))
+
+# Crea il grafico
+ggplot(df, aes(x = term_name, y = neg_log10_pval)) +
+  geom_bar(stat = "identity", fill = "#4D5A80") +
+  coord_flip() +
+  labs(
+    x = "Pathway",
+    y = expression(-log[10](p~value)),
+    title = "Top 20 pathway significativi (gProfiler)"
+  ) +
+  theme_minimal(base_size = 12)

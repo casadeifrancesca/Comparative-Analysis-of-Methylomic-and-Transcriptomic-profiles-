@@ -1,0 +1,232 @@
+if (!requireNamespace("BiocManager", quietly = TRUE)) 
+  install.packages("BiocManager")
+
+# Install required Bioconductor packages if missing
+# BiocManager::install(c("minfi", "IlluminaHumanMethylation450kanno.ilmn12.hg19"))
+# install.packages("rtracklayer")
+
+library(minfi)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(data.table)
+library(GenomicRanges)
+library(rtracklayer)
+library(dplyr)
+library(tidyr)
+library(here)
+library(tidyverse)
+
+# --- LOAD DATA ---
+cpg2gene <- fread(here("data", "cpg2gene__corrected.tsv"), sep = "\t", header = FALSE)
+
+# Get 450k platform annotation
+annotation <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+
+# Select relevant annotation columns
+simplified_annot <- annotation[, c(
+  "Name",                # Probe ID (e.g., cg13869341)
+  "chr",                 # Chromosome
+  "pos",                 # Genomic coordinate
+  "UCSC_RefGene_Name",   # Associated gene name(s) (semicolon separated)
+  "UCSC_RefGene_Group"   # Relative position to gene (e.g., TSS200, Body, etc.)
+)]
+
+annot_matrix <- as.data.frame(simplified_annot)
+
+# Filter annot_matrix to keep only probes present in our cpg2gene file
+annot_matrix_filtered <- annot_matrix[annot_matrix$Name %in% cpg2gene$V1, ]
+
+# Remove probes not associated with any gene
+annot_matrix_filtered <- annot_matrix_filtered[annot_matrix_filtered$UCSC_RefGene_Group != "", ]
+
+# Keep only probes located in TSS regions (TSS200 or TSS1500)
+annot_matrix_tss <- annot_matrix_filtered[
+  grepl("TSS200|TSS1500", annot_matrix_filtered$UCSC_RefGene_Group), ]
+
+# --- MAPPING PROBES TO TFBS ---
+
+# Convert TSS probes to GRanges object
+probes_tss_gr <- GRanges(
+  seqnames = annot_matrix_tss$chr,
+  ranges = IRanges(
+    start = annot_matrix_tss$pos,
+    end = annot_matrix_tss$pos
+  ),
+  strand = "*",
+  Name = annot_matrix_tss$Name
+)
+
+# Load TFBS BED file from data folder
+df_tfbs <- fread(here("data", "unified_tfbs.bed"), sep = "\t", header = FALSE)
+colnames(df_tfbs) <- c("chr", "start", "end", "TF", "strand")
+
+# Correct strand factor levels
+df_tfbs$strand <- factor(df_tfbs$strand, levels = c("+", "-", "*"))
+
+# Convert TFBS to GRanges object
+tfbs_gr <- GRanges(
+  seqnames = df_tfbs$chr,
+  ranges = IRanges(start = df_tfbs$start, end = df_tfbs$end),
+  strand = df_tfbs$strand,
+  TF = df_tfbs$TF
+)
+
+# Find overlaps between TSS probes and TFBS regions
+hits <- findOverlaps(probes_tss_gr, tfbs_gr)
+
+# Extract matched objects
+probes_matched <- probes_tss_gr[queryHits(hits)]
+tfbs_matched <- tfbs_gr[subjectHits(hits)]
+
+# Create a dataframe with combined information
+merged_df <- data.frame(
+  probe_id = mcols(probes_matched)$Name,
+  chr = as.character(seqnames(probes_matched)),
+  pos = start(probes_matched),
+  tfbs_chr = as.character(seqnames(tfbs_matched)),
+  tfbs_start = start(tfbs_matched),
+  tfbs_end = end(tfbs_matched),
+  tf_name = mcols(tfbs_matched)$TF,
+  tf_strand = as.character(strand(tfbs_matched))
+)
+
+# Merge with additional probe info from original annotation
+merged_final <- merge(
+  merged_df,
+  annot_matrix_tss,
+  by.x = "probe_id",
+  by.y = "Name"
+)
+
+# Remove redundant columns
+merged_final_clean <- merged_final[, !(names(merged_final) %in% c("chr.x", "chr.y", "pos.y", "strand"))]
+
+# Function to filter gene-region pairs keeping only TSS200 and TSS1500
+filter_tss_groups <- function(gene_names, region_groups) {
+  genes <- unlist(strsplit(gene_names, ";", fixed = TRUE))
+  regions <- unlist(strsplit(region_groups, ";", fixed = TRUE))
+  keep_idx <- which(regions %in% c("TSS200", "TSS1500"))
+  if (length(keep_idx) == 0) return(c("", ""))
+  new_genes <- paste(genes[keep_idx], collapse = ";")
+  new_regions <- paste(regions[keep_idx], collapse = ";")
+  return(c(new_genes, new_regions))
+}
+
+# Apply filtering function to all rows
+filtered_data <- t(mapply(filter_tss_groups,
+                          merged_final_clean$UCSC_RefGene_Name,
+                          merged_final_clean$UCSC_RefGene_Group))
+
+merged_final_clean$UCSC_RefGene_Name <- filtered_data[, 1]
+merged_final_clean$UCSC_RefGene_Group <- filtered_data[, 2]
+
+# Matrix cleaning: remove tf_strand and handle duplicates
+merged_cleaned <- merged_final_clean %>%
+  select(-tf_strand) %>% 
+  distinct()
+
+# Separate rows for multiple gene assignments
+probes2tfbs <- merged_cleaned %>%
+  separate_rows(UCSC_RefGene_Name, UCSC_RefGene_Group, sep = ";") %>%
+  distinct()
+
+# Save intermediate mapping file to results
+write.table(
+  probes2tfbs,
+  here("results", "probes2tfbs.tsv"),
+  sep = "\t", row.names = FALSE, quote = FALSE
+)
+
+# --- MAPPING PROBES TO GENES OF INTEREST ---
+
+# Load lists generated in previous scripts from /results
+deregulated_genes <- readLines(here("results", "degs_dmgs_intersect.txt"))
+
+# Create matrix for deregulated genes (intersection DEGs/DMGs)
+tfbs_demgs <- probes2tfbs %>%
+  filter(UCSC_RefGene_Name %in% deregulated_genes)
+
+# Print count of distinct genes found
+cat("Distinct deregulated genes in TFBS:", n_distinct(tfbs_demgs$UCSC_RefGene_Name), "\n")
+
+# --- DIFFERENTIAL METHYLATION ANALYSIS AT PROBE LEVEL ---
+
+# Load methylation data from /data
+meth_tumoral <- fread(here("data", "paad_meth_tumoral_450.tsv"), sep = "\t", header = TRUE) 
+meth_normal <- fread(here("data", "paad_meth_normal_450.tsv"), sep = "\t", header = TRUE)
+
+# Filter cpg_2_gene for probes located in TFBS of interest
+cpg_2_gene_filtered <- cpg2gene %>%
+  filter(V1 %in% tfbs_demgs$probe_id)
+setnames(cpg_2_gene_filtered, "V1", "composite_element_ref")
+
+# Merge methylation matrices with filtered probes
+meth_tumoral_matched <- merge(meth_tumoral, cpg_2_gene_filtered, by = "composite_element_ref")
+meth_normal_matched <- merge(meth_normal, cpg_2_gene_filtered, by = "composite_element_ref")
+
+# Merge normal and tumoral for common probes
+meth_all <- inner_join(meth_normal_matched, meth_tumoral_matched, by = "composite_element_ref")
+
+# Statistical Testing
+threshold_dbeta <- 0.1
+threshold_pval_meth <- 0.05
+
+probe_ids <- as.character(meth_all[[1]])
+data_meth <- meth_all[, -1]
+rownames(data_meth) <- probe_ids
+
+col_names <- colnames(meth_all)
+samplesN <- col_names[grep(":normal$", col_names)]
+samplesT <- col_names[grep(":tumoral$", col_names)]
+
+dataN_meth <- data_meth[, ..samplesN]
+dataT_meth <- data_meth[, ..samplesT]
+
+# Calculate Delta Beta (Tumor - Normal)
+dbeta_probes <- rowMeans(dataT_meth) - rowMeans(dataN_meth)
+
+num_N <- length(samplesN)
+
+# Row-wise T-test
+pval_probes <- apply(data_meth, 1, function(row){
+  x <- as.numeric(row[1:num_N])
+  y <- as.numeric(row[(num_N+1):ncol(data_meth)])
+  if (length(unique(x)) > 1 || length(unique(y)) > 1) {
+    t.test(x, y, paired = FALSE)$p.value
+  } else {
+    NA  # Constant data
+  }
+})
+
+# FDR Correction
+pval_adj_probes <- p.adjust(pval_probes, method="fdr")
+
+# Apply significance and Delta Beta thresholds
+keep_idx <- which(pval_adj_probes <= threshold_pval_meth & abs(dbeta_probes) >= threshold_dbeta)
+
+# Compile results for significant probes
+results_probes <- data.frame(
+  probe_id = probe_ids[keep_idx],
+  pval = pval_probes[keep_idx],
+  FDR = pval_adj_probes[keep_idx],
+  dbeta = dbeta_probes[keep_idx],
+  direction = ifelse(dbeta_probes[keep_idx] > 0, "hyper", "hypo")
+)
+
+# Merge with TFBS information
+final_output <- merge(results_probes, tfbs_demgs, by = "probe_id")
+
+# Remove NAs and unnecessary columns
+final_output <- na.omit(final_output)
+
+# Save final results to results folder
+write.table(
+  final_output, 
+  file = here("results", "dm_probes_in_tfbs_demgs.tsv"), 
+  row.names = FALSE, 
+  sep = "\t", 
+  quote = FALSE,
+  col.names = c("probe_id", "pval", "FDR", "dbeta", "direction", "pos", "chr", 
+                "tfbs_start", "tfbs_end", "tf_name", "gene_symbol", "group")
+)
+
+message("Analysis of probes in TFBS complete. Results saved in /results.")

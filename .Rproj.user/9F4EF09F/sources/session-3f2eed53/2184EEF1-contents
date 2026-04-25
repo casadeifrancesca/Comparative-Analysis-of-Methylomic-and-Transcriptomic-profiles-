@@ -1,0 +1,53 @@
+# Imposta la directory di lavoro
+setwd("C:/Users/LENOVO/metilazione_vera/matrici_tcga/go_gprof")
+
+# Installa il pacchetto se necessario
+if (!require("gprofiler2")) {
+  install.packages("gprofiler2")
+}
+
+library(gprofiler2)
+
+# Leggi la lista dei geni
+gene_list <- readLines("down_list.txt")
+
+# Nome del file di output
+nome_file_risultati <- "down_bp_result.tsv"
+
+tipo <- "GO:BP"
+
+#----------------------------------------------------
+
+# Esegui l'arricchimento GO con g:Profiler
+# include solo l'ontologia Molecular Function (GO:MF)
+gost_res <- gost(
+  query = gene_list,
+  organism = "hsapiens",
+  sources = c(tipo),
+  correction_method = "fdr",
+  significant = FALSE  # mostra anche i non significativi
+)
+
+# Estrai la tabella dei risultati
+results <- gost_res$result
+
+# Ordina per p-value corretto (FDR)
+results <- results[order(results$p_value), ]
+
+# Seleziona i primi 20 termini con FDR più significativo
+top20 <- head(results, 20)
+
+top20_clean <- as.data.frame(lapply(top20, function(x) {
+  if (is.list(x)) sapply(x, paste, collapse = ",") else x
+}))
+
+
+# ⚠️ Controllo: tutti i p-value (adjusted) sotto 0.05?
+cat("Tutti i p-value adjusted < 0.05? ", all(top20$p_value < 0.05), "\n")
+
+# ❌ Elimina righe con p-value > 0.05
+top20_clean <- top20_clean[top20_clean$p_value < 0.05, ]
+
+# Salva i risultati
+write.table(top20_clean, nome_file_risultati, sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+

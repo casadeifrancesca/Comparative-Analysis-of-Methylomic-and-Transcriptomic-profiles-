@@ -1,0 +1,292 @@
+library(data.table)
+library(dplyr)
+library(tibble)
+library(here)
+
+# Create results directory if it doesn't exist
+if (!dir.exists(here("results"))) {
+  dir.create(here("results"))
+}
+
+### Option 1: Pre-processed Matrices ##################################################################
+
+# Load final processed matrices if available
+tmp_meth <- read.table(here("data", "meth_final.tsv"), header = T, sep = "\t", check.names = F)
+tmp <- read.table(here("data", "geq_final.tsv"), header = T, sep = "\t", check.names = F)
+
+#### Option 2: Matrix Processing ######################################################################
+
+# METHYLATION -----------------------------------------------------------------------------------------
+
+# Load raw methylation data
+meth_tumoral <- fread(here("data", "paad_meth_tumoral_450.tsv"), sep = "\t", header = TRUE) 
+meth_normal <- fread(here("data", "paad_meth_normal_450.tsv"), sep = "\t", header = TRUE)
+
+# Load probe-to-gene annotation
+cpg_2_gene <- fread(here("data", "cpg2gene__corrected.tsv"), sep = "\t", header = FALSE)
+
+# Rename probe column for merging
+setnames(cpg_2_gene, "V1", "composite_element_ref")
+
+# Merge with gene annotation and filter out unassigned probes
+meth_tumoral_genes <- merge(meth_tumoral, cpg_2_gene, by = "composite_element_ref", all.x = TRUE)
+meth_tumoral_genes <- meth_tumoral_genes %>% 
+  filter(!is.na(V2) & V2 != "")
+
+meth_normal_genes <- merge(meth_normal, cpg_2_gene, by = "composite_element_ref", all.x = TRUE)
+# Remove rows with probes not assigned to genes
+meth_normal_genes <- meth_normal_genes %>% 
+  filter(!is.na(V2) & V2 != "")
+
+# Calculate average methylation across probes for each gene (excluding NAs)
+
+# Tumoral
+# Separate numeric columns and the gene column (V2)
+numeric_cols <- sapply(meth_tumoral_genes, is.numeric)
+meth_tumoral_genes_numeric <- meth_tumoral_genes[, ..numeric_cols]
+meth_tumoral_genes_numeric$V2 <- meth_tumoral_genes$V2 
+# Aggregate by gene (V2) calculating the mean
+meth_tumoral_avg <- aggregate(. ~ V2, data = meth_tumoral_genes_numeric, FUN = function(x) mean(x, na.rm = TRUE))
+
+# Normal
+numeric_cols <- sapply(meth_normal_genes, is.numeric)
+meth_normal_genes_numeric <- meth_normal_genes[, ..numeric_cols]
+meth_normal_genes_numeric$V2 <- meth_normal_genes$V2
+meth_normal_avg <- aggregate(. ~ V2, data = meth_normal_genes_numeric, FUN = function(x) mean(x, na.rm = TRUE))
+
+# Merge tumoral and normal averaged matrices
+meth_all <- inner_join(meth_normal_avg, meth_tumoral_avg, by = "V2")
+# Rename gene column for subsequent filtering with expression matrix
+colnames(meth_all)[colnames(meth_all) == "V2"] <- "gene_symbol"
+
+# Filter by Interquartile Range (IQR) - keep top 90% most variable genes
+iqr_values_meth <- apply(meth_all[, -1], 1, IQR)
+threshold_meth <- quantile(iqr_values_meth, 0.10)
+meth_iqr <- meth_all[iqr_values_meth > threshold_meth, ]
+tmp_meth <- meth_iqr
+
+
+# EXPRESSION ------------------------------------------------------------------------------------------
+
+# Load raw expression data
+paad_geq_tumoral <- fread(here("data", "paad_geq_tumoral.tsv"), sep = "\t", header = TRUE)
+paad_geq_normal <- fread(here("data", "paad_geq_normal.tsv"), sep = "\t", header = TRUE)
+
+# Function to remove gene versioning (e.g., ENSG000001.1 -> ENSG000001)
+remove_gene_versions <- function(data, column_name = "gene_symbol") {
+  setDT(data)
+  data[, (column_name) := sub("\\.\\d+$", "", get(column_name))]
+  return(data)
+}
+
+# Apply version removal
+geq_normal_clean <- remove_gene_versions(paad_geq_normal)
+geq_tumoral_clean <- remove_gene_versions(paad_geq_tumoral) 
+
+# Function to average duplicates
+average_duplicates <- function(data) {
+  setDT(data)
+  averaged_data <- data[, lapply(.SD, mean), by = gene_symbol]
+  return(averaged_data)
+}
+
+# Apply duplicate averaging
+geq_tumoral_avg <- average_duplicates(geq_tumoral_clean)
+geq_normal_avg <- average_duplicates(geq_normal_clean)
+
+# Merge both expression matrices
+geq_all <- full_join(geq_normal_avg, geq_tumoral_avg, by = "gene_symbol")
+
+# Remove genes with zero expression across all samples
+geq_noZero <- geq_all[rowSums(geq_all[, -1] != 0) > 0, ]
+
+# Apply Log2(x + 1) transformation
+geq_log <- geq_noZero %>%
+  mutate(across(-c(gene_symbol), ~ log2(. + 1)))
+
+# Filter by IQR - keep top 90% most variable genes
+iqr_values <- apply(geq_log[, -1], 1, IQR)
+threshold <- quantile(iqr_values, 0.10)
+geq_iqr <- geq_log[iqr_values > threshold, ]
+
+# Rename for statistical testing
+tmp <- geq_iqr
+
+
+# FILTERING FOR COMMON GENES AND SAMPLES ##############################################################
+
+# Subset normal and tumoral samples
+geq_norm <- tmp[, 1:5]
+geq_tum <- tmp[, c(1, 6:183)]
+
+meth_norm <- tmp_meth[, 1:11]
+meth_tum <- tmp_meth[, c(1, 6:196)]
+
+# Keep only common samples between geq and meth
+common_samples_norm <- intersect(colnames(geq_norm), colnames(meth_norm))
+meth_norm <- meth_norm[, common_samples_norm, drop = FALSE]
+
+common_samples_tum <- intersect(colnames(geq_tum), colnames(meth_tum))
+meth_tum <- meth_tum[, common_samples_tum, drop = FALSE]
+
+# Final merge for common samples
+tmp_meth <- merge(meth_norm, meth_tum, by = "gene_symbol", all = FALSE)
+tmp <- merge(geq_norm, geq_tum, by = "gene_symbol", all = FALSE)
+
+# Filter for common genes across both omics
+genes_geq <- tmp$gene_symbol
+genes_meth <- tmp_meth$gene_symbol
+
+common_genes <- intersect(genes_geq, genes_meth)
+
+tmp <- tmp[tmp$gene_symbol %in% common_genes, , drop = FALSE]
+tmp_meth <- tmp_meth[tmp_meth$gene_symbol %in% common_genes, , drop = FALSE]
+
+# Save final processed matrices to /results
+write.table(tmp, here("results", "geq_final.tsv"), sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+write.table(tmp_meth, here("results", "meth_final.tsv"), sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+
+### STATISTICAL TESTING ###############################################################################
+
+### EXPRESSION (DGE) ----------------------------------------------------------------------------------
+
+# soglia_fc <- 1.5 # Fold Change threshold not applied in this specific run
+threshold_pval <- 0.05
+
+genes <- tmp[,1]
+data <- tmp[,-1]
+
+data <- as.data.frame(data)
+rownames(data) <- genes
+
+column_names <- colnames(tmp)
+
+samplesN <- column_names[grep(":normal$", column_names)]
+samplesT <- column_names[grep(":tumoral$", column_names)]
+
+dataN <- data[, samplesN]
+dataT <- data[, samplesT]
+
+# Calculate Log2 Fold Change
+log2FC <- rowMeans(dataT) - rowMeans(dataN)
+
+N <- ncol(dataN)
+M <- ncol(data)
+
+# Perform row-wise T-test
+pval <- apply(data, 1, function(data){
+  t.test(data[1:N], data[(N+1):(M)], paired=FALSE)$p.value
+})
+
+# FDR Adjustment
+pval_adj <- p.adjust(pval, method="fdr")
+
+data$p_val <- pval
+data$pval_adj <- pval_adj
+
+# Apply significance filters
+indices_to_remove <- which(pval_adj > threshold_pval)
+
+if (length(indices_to_remove) > 0){
+  dataN <- dataN[-indices_to_remove,]
+  dataT <- dataT[-indices_to_remove,]
+  data  <- data[-indices_to_remove,]
+  genes <- genes[-indices_to_remove]
+  log2FC <- log2FC[-indices_to_remove]
+  pval <- pval[-indices_to_remove]
+  pval_adj <- pval_adj[-indices_to_remove]
+}
+
+rm(indices_to_remove)
+
+direction <- ifelse(log2FC > 0, "up", "down")
+
+# Export DGE results
+results_geq <- data.frame(genes, pval, pval_adj, log2FC, direction)
+
+# Save DEG list to /results
+degs_list <- results_geq[[1]]
+writeLines(degs_list, here("results", "degs_list.txt"))
+
+# Print number of significant genes
+sig_count <- sum(results_geq$pval_adj < 0.05, na.rm = TRUE)
+cat("Number of significant DEGs (FDR < 0.05):", sig_count, "\n")
+
+
+### METHYLATION (DMG) ---------------------------------------------------------------------------------
+
+threshold_dbeta <- 0.1
+threshold_pval_meth <- 0.05
+
+genes_meth_list <- tmp_meth[,1]
+data_meth <- tmp_meth[, -1]
+rownames(data_meth) <- genes_meth_list
+
+column_names_meth <- colnames(tmp_meth)
+samplesN_meth <- column_names_meth[grep(":normal$", column_names_meth)]
+samplesT_meth <- column_names_meth[grep(":tumoral$", column_names_meth)]
+
+dataN_meth <- data_meth[, samplesN_meth]
+dataT_meth <- data_meth[, samplesT_meth]
+
+# Calculate Delta Beta
+dbeta = rowMeans(dataT_meth) - rowMeans(dataN_meth)
+
+N_meth <- ncol(dataN_meth)
+M_meth <- ncol(data_meth)
+
+# Perform row-wise T-test for methylation
+pval_meth <- apply(data_meth, 1, function(data_meth){
+  t.test(data_meth[1:N_meth], data_meth[(N_meth+1):(M_meth)], paired=FALSE)$p.value
+})
+
+pval_adj_meth <- p.adjust(pval_meth, method="fdr")
+
+# Apply significance and effect size filters (Delta Beta)
+indices_meth_remove <- which(pval_adj_meth > threshold_pval_meth | abs(dbeta) < threshold_dbeta)
+
+if (length(indices_meth_remove) > 0){
+  dataN_meth <- dataN_meth[-indices_meth_remove,]
+  dataT_meth <- dataT_meth[-indices_meth_remove,]
+  data_meth  <- data_meth[-indices_meth_remove,]
+  genes_meth_list <- genes_meth_list[-indices_meth_remove]
+  dbeta <- dbeta[-indices_meth_remove]
+  pval_meth <- pval_meth[-indices_meth_remove]
+  pval_adj_meth <- pval_adj_meth[-indices_meth_remove]
+}
+
+rm(indices_meth_remove)
+
+direction_meth <- ifelse(dbeta > 0, "hyper", "hypo")
+
+# Export DMG results
+results_meth <- data.frame(genes_meth_list, pval_meth, pval_adj_meth, dbeta, direction_meth)
+
+# Save DMG list to /results
+dmgs_list <- results_meth[[1]]
+writeLines(dmgs_list, here("results", "dmgs_list.txt"))
+
+# Print number of significant genes
+sig_count_meth <- sum(results_meth$pval_adj_meth < 0.05, na.rm = TRUE)
+cat("Number of significant DMGs (FDR < 0.05):", sig_count_meth, "\n")
+
+
+### CROSS-OMIC INTERSECTION ###########################################################################
+
+# Find common genes between DEGs and DMGs
+common_genes_intersect <- intersect(results_geq$genes, results_meth$genes_meth_list)
+writeLines(common_genes_intersect, here("results", "degs_dmgs_intersect.txt"))
+
+# Filter both result matrices for intersection
+results_geq_filtered <- results_geq[results_geq$genes %in% common_genes_intersect, c("genes", "pval_adj", "log2FC", "direction")]
+results_meth_filtered <- results_meth[results_meth$genes_meth_list %in% common_genes_intersect, c("genes_meth_list", "pval_adj_meth", "dbeta", "direction_meth")]
+
+colnames(results_meth_filtered)[1] <- "genes"
+colnames(results_geq_filtered)[1] <- "genes"
+
+# Merge results for intersection table
+intersection <- merge(results_geq_filtered, results_meth_filtered, by = "genes")
+
+# Save final intersection table to /results
+write.table(intersection, here("results", "intersection.tsv"), sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)

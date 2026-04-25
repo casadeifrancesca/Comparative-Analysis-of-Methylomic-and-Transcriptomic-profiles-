@@ -1,0 +1,401 @@
+setwd("C:/Users/LENOVO/metilazione_vera/matrici_tcga")
+
+library(data.table)
+library(dplyr)
+library(tibble)
+
+### Opzione 1: Matrici già processate ##################################################################
+
+tmp_meth <- read.table("meth_final.tsv", header = T, sep = "\t", check.names = F)
+tmp <- read.table("geq_final.tsv", header = T, sep = "\t", check.names = F)
+
+#### Opzione 2: Processing matrici ################################################################################################
+
+# METILAZIONE --------------------------------------------------------------------------------------------------------
+
+meth_tumoral <- fread("paad_meth_tumoral_450.tsv", sep = "\t", header = TRUE) 
+meth_normal <- fread("paad_meth_normal_450.tsv", sep = "\t", header = TRUE)
+
+cpg_2_gene <- fread("cpg2gene__corrected.tsv", sep = "\t", header = FALSE)
+#rinomino la colonna relativa alle probe per poi fare merging coi geni
+setnames(cpg_2_gene, "V1", "composite_element_ref")
+
+#merging coi geni 
+meth_tumoral_genes <- merge(meth_tumoral, cpg_2_gene, by = "composite_element_ref", all.x = TRUE)
+meth_tumoral_genes <- meth_tumoral_genes %>% 
+  filter(!is.na(V2) & V2 != "")
+
+meth_normal_genes <- merge(meth_normal, cpg_2_gene, by = "composite_element_ref", all.x = TRUE)
+#elimino le righe relative a probe non assegnate a geni
+meth_normal_genes <- meth_normal_genes %>% 
+  filter(!is.na(V2) & V2 != "")
+
+#media delle probe escludendo gli NA:
+#tumoral
+#Separa le colonne numeriche e la colonna dei geni
+numeric_cols <- sapply(meth_tumoral_genes, is.numeric)
+meth_tumoral_genes_numeric <- meth_tumoral_genes[, ..numeric_cols]  # Usa .. per selezionare colonne numeriche
+meth_tumoral_genes_numeric$V2 <- meth_tumoral_genes$V2  # Aggiungi di nuovo la colonna V2
+#calcola la media usando aggregate, escludendo gli NA
+meth_tumoral_media <- aggregate(. ~ V2, data = meth_tumoral_genes_numeric, FUN = function(x) mean(x, na.rm = TRUE))
+#normal
+numeric_cols <- sapply(meth_normal_genes, is.numeric)
+meth_normal_genes_numeric <- meth_normal_genes[, ..numeric_cols]  # Usa .. per selezionare colonne numeriche
+meth_normal_genes_numeric$V2 <- meth_normal_genes$V2  # Aggiungi di nuovo la colonna V2
+meth_normal_media <- aggregate(. ~ V2, data = meth_normal_genes_numeric, FUN = function(x) mean(x, na.rm = TRUE))
+
+#merging di tumoral e normal
+meth_all <- inner_join(meth_normal_media, meth_tumoral_media, by = "V2")
+#cambio nome colonna dei geni per poi fare il filtering dei geni in comune con la matrice di espressione
+colnames(meth_all)[colnames(meth_all) == "V2"] <- "gene_symbol"
+
+#IQR
+iqr_values_meth <- apply(meth_all[, -1], 1, IQR)
+threshold_meth <- quantile(iqr_values_meth, 0.10)
+meth_iqr <- meth_all[iqr_values_meth > threshold_meth, ]
+tmp_meth <- meth_iqr
+
+
+# ESPRESSIONE --------------------------------------------------------------------------------------------------------
+
+paad_geq_tumoral <- fread("paad_geq_tumoral.tsv", sep = "\t", header = TRUE)
+paad_geq_normal <- fread("paad_geq_normal.tsv", sep = "\t", header = TRUE)
+
+#funzione per unire geni e versioni
+#funzione 1
+remove_gene_versions <- function(data, column_name = "gene_symbol") {
+  # Ensure data is a data.table
+  setDT(data)
+  
+  # Remove version numbers from the specified column
+  data[, (column_name) := sub("\\.\\d+$", "", get(column_name))]
+  
+  return(data)
+}
+
+#chiamata
+geq_normal_avg <- remove_gene_versions(paad_geq_normal)
+geq_tumoral_avg <- remove_gene_versions(paad_geq_tumoral) 
+
+#funzione 2
+average_duplicates <- function(data) {
+  # Set data as data.table
+  setDT(data)
+  
+  # Calculate mean for each gene_symbol, excluding gene_symbol column from averaging
+  averaged_data <- data[, lapply(.SD, mean), by = gene_symbol]
+  
+  return(averaged_data)
+}
+
+#chiamata
+geq_tumoral_avg <- average_duplicates(geq_tumoral_avg)
+geq_normal_avg <- average_duplicates(geq_normal_avg)
+
+#merging delle due matrici 
+geq_all <- full_join(geq_normal_avg, geq_tumoral_avg, by = "gene_symbol")
+
+#eliminazione dei geni che hanno zero in tutte le colonne
+geq_noZero <- geq_all[rowSums(geq_all[, -1] != 0) > 0, ]
+
+#log2 + 1
+geq_log <- geq_noZero %>%
+  mutate(across(-c(gene_symbol), ~ log2(. + 1)))
+
+
+#IQR
+#calcola l'IQR per ogni gene
+iqr_values <- apply(geq_log[, -1], 1, IQR)
+# Calcola il decimo percentile degli IQR
+threshold <- quantile(iqr_values, 0.10)
+# Filtra i geni con IQR superiore alla soglia e crea la nuova matrice
+geq_iqr <- geq_log[iqr_values > threshold, ]
+
+
+#rinominazione per test statistici
+tmp <- geq_iqr
+
+# filtering per geni e campioni in comune #################################################################################
+
+#campioni
+geq_norm <- tmp[, 1:5]
+geq_tum <- tmp[, c(1, 6:183)]
+
+meth_norm <- tmp_meth[, 1:11]
+meth_tum <- tmp_meth[, c(1, 6:196)]
+
+common_samples_norm <- intersect(colnames(geq_norm), colnames(meth_norm))
+meth_norm <- meth_norm[, common_samples_norm, drop = FALSE]
+
+common_samples_tum <- intersect(colnames(geq_tum), colnames(meth_tum))
+meth_tum <- meth_tum[, common_samples_tum, drop = FALSE]
+
+tmp_meth <- merge(meth_norm, meth_tum, by = "gene_symbol", all = FALSE)
+tmp <- merge(geq_norm, geq_tum, by = "gene_symbol", all = FALSE)
+
+#geni
+geni_geq <- tmp$gene_symbol
+geni_meth <- tmp_meth$gene_symbol
+
+common_genes <- intersect(geni_geq, geni_meth)
+
+tmp <- tmp[tmp$gene_symbol %in% common_genes, , drop = FALSE]
+tmp_meth <- tmp_meth[tmp_meth$gene_symbol %in% common_genes, , drop = FALSE]
+
+write.table(tmp, "geq_final.tsv", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+write.table(tmp_meth, "meth_final.tsv", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+
+
+
+
+
+
+
+
+
+### test statistici ###################################################################################
+
+### ESPRESSIONE ---------------------------------------------------------------------------------------
+
+#soglia_fc <- 1.5
+soglia_pval <- 0.05
+
+geni <- tmp[,1]
+data <- tmp[,-1]
+
+#geni_vector <- as.vector(geni$gene_symbol)
+data <- as.data.frame(data)  # Converte in dataframe
+rownames(data) <- geni
+#rownames(data) <- geni_vector
+
+column_names <- colnames(tmp)
+
+samplesN <- column_names[grep(":normal$", column_names)]
+samplesT <- column_names[grep(":tumoral$", column_names)]
+
+dataN <- data[, samplesN]
+dataT <- data[, samplesT]
+
+log2FC <- rowMeans(dataT) - rowMeans(dataN)
+
+N <- ncol(dataN)
+M <- ncol(data)
+
+pval <- apply(data, 1, function(data){
+  t.test(data[1:N], data[(N+1):(M)], paired=FALSE)$p.value
+})
+pval_adj <- p.adjust(pval, method="fdr")
+
+data$p_val <- pval
+data$pval_adj <- pval_adj
+
+direction <- ifelse(log2FC > 0, "up", "down")
+
+# Export results
+results_geq <- data.frame(geni, pval, pval_adj, log2FC, direction)
+results_geq$significativo <- results_geq$pval_adj < soglia_pval
+
+# volcano plot --------------------------------------------------------------------------------------------------
+
+soglia_log10 <- -log10(soglia_pval)
+
+ggplot(results_geq, aes(x = log2FC, y = -log10(pval_adj))) +
+  geom_point(
+    aes(color = ifelse(significativo, direction, "non_sig")),
+    alpha = 0.8
+  ) +
+  scale_color_manual(
+    values = c("up" = "#C47EA0", "down" = "#2E4372", "non_sig" = "gray70"),
+    name = "Direzione"
+  ) +
+  geom_hline(yintercept = soglia_log10, linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = 0, color = "black", size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 0.5) +
+  labs(
+    x = "log2 Fold Change",
+    y = "-log10(Adjusted P-Value)",
+    title = "Volcano Plot"
+  ) +
+  theme_minimal()
+
+
+#filtri per le soglie -----------------------------
+
+#pval
+ind <- which(pval_adj > soglia_pval)
+
+if (length(ind)>0){
+  dataN <- dataN[-ind,]
+  dataT <- dataT[-ind,]
+  data  <- data[-ind,]
+  geni  <- geni[-ind]
+  log2FC <- log2FC[-ind]
+  pval <- pval[-ind]
+  pval_adj <- pval_adj[-ind]
+}
+
+rm(ind)
+
+#FC
+#ind <- which(abs(log2FC) < log2(soglia_fc))
+
+#if (length(ind)>0){
+#  dataN <- dataN[-ind,]
+#  dataT <- dataT[-ind,]
+#  data  <- data[-ind,]
+#  geni  <- geni[-ind]
+#  log2FC <- log2FC[-ind]
+#  pval <- pval[-ind]
+#  pval_adj <- pval_adj[-ind]
+#}
+
+#rm(ind)
+
+
+
+
+#write.table(results_geq, file= "DEGs.txt", row.names=FALSE, 
+#            col.names=c("Gene", "pval", "FDR", "log2-FC", "direction"), sep = "\t", quote = FALSE)
+
+#results_up <- results_geq[results_geq$direction == "up", ]
+#results_down <- results_geq[results_geq$direction == "down", ]
+
+#salva degs
+degs_list <- results_geq[[1]]
+writeLines(degs_list, "degs_list.txt")
+
+#quanti p value significativi ci sono dopo la correzione
+p_significativi <- sum(results_geq$pval_adj < 0.05, na.rm = TRUE)
+cat("Numero di p value significativi dopo la correzione (espressione):", p_significativi)
+
+
+### METILAZIONE ----------------------------------------------------------------------------------------------------
+
+soglia_dbeta <- 0.1
+soglia_pval_meth <- 0.05
+
+geni_meth <- tmp_meth[,1]
+data_meth <- tmp_meth[, -1]
+rownames(data_meth) <- geni_meth
+
+column_names <- colnames(tmp_meth)
+samplesN <- column_names[grep(":normal$", column_names)]
+samplesC <- column_names[grep(":tumoral$", column_names)]
+
+dataN_meth <- data_meth[, samplesN]
+dataC_meth <- data_meth[, samplesC]
+
+dbeta = rowMeans(dataC_meth) - rowMeans(dataN_meth)
+
+N_meth <- ncol(dataN_meth)
+M_meth <- ncol(data_meth)
+
+pval_meth <- apply(data_meth, 1, function(data_meth){
+  t.test(data_meth[1:N_meth], data_meth[(N_meth+1):(M_meth)], paired=FALSE)$p.value
+})
+
+pval_adj_meth <- p.adjust(pval_meth, method="fdr")
+data_meth$p_val <- pval_adj_meth 
+
+direction <- ifelse(dbeta > 0, "iper", "ipo")
+
+results_meth <- data.frame(geni_meth,pval_meth,pval_adj_meth,dbeta, direction)
+
+# Aggiungi colonna "significativo" (sia per pval che per dbeta)
+results_meth$significativo <- with(results_meth, 
+                                        (pval_adj_meth < soglia_pval_meth) & (abs(dbeta) >= soglia_dbeta))
+
+results_meth$colorazione <- ifelse(results_meth$significativo,
+                                   results_meth$direction,
+                                   "non_sig")
+
+
+# Calcola soglia log10 per la p-value adjusted
+soglia_log10_meth <- -log10(soglia_pval_meth)
+
+
+ggplot(results_meth, aes(x = dbeta, y = -log10(pval_adj_meth), color = colorazione)) +
+  geom_point(alpha = 0.8) +
+  scale_color_manual(
+    values = c("iper" = "#C47EA0", "ipo" = "#2E4372", "non_sig" = "gray70"),
+    name = "Direzione"
+  ) +
+  # Rette di soglia
+  geom_hline(yintercept = soglia_log10_meth, linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = 0, color = "black", size = 0.5) +
+  geom_hline(yintercept = 0, color = "black", size = 0.5) +
+  geom_vline(xintercept = soglia_dbeta, linetype = "dashed", color = "gray40") +
+  geom_vline(xintercept = -soglia_dbeta, linetype = "dashed", color = "gray40") +
+  labs(
+    x = "Delta Beta",
+    y = "-log10(Adjusted P-Value)",
+    title = "Volcano Plot – Metilazione"
+  ) +
+  theme_minimal()
+
+
+
+#filtri per soglie
+
+#pval
+ind_meth <- which(pval_adj_meth > soglia_pval_meth)
+
+if (length(ind_meth)>0){
+  dataN_meth <- dataN_meth[-ind_meth,]
+  dataC_meth <- dataC_meth[-ind_meth,]
+  data_meth  <- data_meth[-ind_meth,]
+  geni_meth  <- geni_meth[-ind_meth]
+  dbeta <- dbeta[-ind_meth]
+  pval_meth <- pval_meth[-ind_meth]
+  pval_adj_meth <- pval_adj_meth[-ind_meth]
+}
+
+rm(ind_meth)
+
+#delta beta
+ind_meth <- which(abs(dbeta) < (soglia_dbeta))
+
+if (length(ind_meth)>0){
+  dataN_meth <- dataN_meth[-ind_meth,]
+  dataC_meth <- dataC_meth[-ind_meth,]
+  data_meth  <- data_meth[-ind_meth,]
+  geni_meth  <- geni_meth[-ind_meth]
+  dbeta <- dbeta[-ind_meth]
+  pval_meth <- pval_meth[-ind_meth]
+  pval_adj_meth <- pval_adj_meth[-ind_meth]
+}
+
+rm(ind_meth)
+
+#write.table(results_meth, file= "DMGs.txt", row.names=FALSE, 
+#            col.names=c("geni", "pval", "FDR", "dbeta", "direction"), sep = "\t", quote = FALSE)
+
+#salva dmgs
+dmgs_list <- results_meth[[1]]
+writeLines(dmgs_list, "dmgs_list.txt")
+
+#quanti p value significativi ci sono dopo la correzione
+p_significativi_meth <- sum(results_meth$pval_adj_meth < 0.05, na.rm = TRUE)
+cat("Numero di p value significativi dopo la correzione (metilazione):", p_significativi_meth)
+
+### intersezione geq meth ####################################################################
+
+# Trova i geni comuni
+
+geni_comuni <- intersect(results_geq$geni, results_meth$geni_meth)
+writeLines(geni_comuni, "degs_dmgs_intesect.txt")
+
+# Filtra le due matrici per i geni comuni
+results_geq_filtrati <- results_geq[results_geq$geni %in% geni_comuni, c("geni", "pval", "pval_adj", "log2FC", "direction")]
+results_meth_filtrati <- results_meth[results_meth$geni_meth %in% geni_comuni, c("geni_meth", "pval_meth", "pval_adj_meth", "dbeta", "direction")]
+
+colnames(results_meth_filtrati)[1] <- "geni"
+colnames(results_geq_filtrati)[1] <- "geni"
+
+# Unisci le due matrici sulla colonna "geni"
+intersezione <- merge(results_geq_filtrati, results_meth_filtrati, by = "geni")
+intersezione <- intersezione[, -2, drop = FALSE]
+intersezione <- intersezione[, -5, drop = FALSE]
+
+write.table(intersezione, "intersezione.tsv", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)

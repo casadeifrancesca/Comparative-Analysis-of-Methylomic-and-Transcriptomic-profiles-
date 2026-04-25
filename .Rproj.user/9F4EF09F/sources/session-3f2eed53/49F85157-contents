@@ -1,0 +1,193 @@
+setwd("C:/Users/LENOVO/metilazione_vera/matrici_tcga")
+
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(data.table)
+library(ggplot2)
+library(tidyr)
+library(gridExtra)
+
+meth <- read.table("meth_final.tsv", header = TRUE, sep = "\t", check.names = FALSE)
+geq <- read.table("geq_final.tsv", header = TRUE, sep = "\t", check.names = FALSE)
+
+# Filtraggio per geni in intersezione
+intersezione <- read.table("degs_dmgs_intersect.txt", header = FALSE, sep = "\t", check.names = FALSE)
+geni_intersezione <- intersezione[, 1]
+
+geq <- geq[geq[, 1] %in% geni_intersezione, ]
+meth <- meth[meth[, 1] %in% geni_intersezione, ]
+
+# Soglie
+soglia_pval <- 0.05
+soglia_padj <- 0.05
+soglia_cor_pos <- 0.4
+soglia_cor_neg <- -0.4
+
+# Risultati della correlazione
+spearman_results <- data.frame(
+  gene = geq[, 1], 
+  correlation = numeric(nrow(geq)),
+  p_value = numeric(nrow(geq))
+)
+
+geq_data <- geq[, -1]  
+meth_data <- meth[, -1]
+
+for (i in seq_len(nrow(geq))) {
+  expression_values <- as.numeric(geq_data[i, ])
+  methylation_values <- as.numeric(meth_data[i, ])
+  
+  test_result <- cor.test(expression_values, methylation_values, method = "spearman")
+  
+  spearman_results$correlation[i] <- test_result$estimate
+  spearman_results$p_value[i] <- test_result$p.value
+}
+
+# Aggiunta p-value aggiustato
+spearman_results <- spearman_results %>%
+  mutate(p_value_adj = p.adjust(p_value, method = "fdr"))
+
+# Filtra solo quelli significativi
+spearman_results <- spearman_results %>%
+  filter(p_value_adj < soglia_padj)
+
+genes_neg <- spearman_results$gene[spearman_results$correlation <= soglia_cor_neg]
+genes_pos <- spearman_results$gene[spearman_results$correlation >= soglia_cor_pos]
+
+spearman_results_filtrata <- spearman_results %>%
+  filter(gene %in% c(genes_neg, genes_pos))
+
+#cat("Geni con correlazione positiva:\n")
+#print(genes_pos)
+#cat("\nGeni con correlazione negativa:\n")
+#print(genes_neg)
+
+# Salva lista di geni
+cor_gene_list <- spearman_results_filtrata$gene
+writeLines(cor_gene_list, "cor_gene_list.txt")
+
+# Prepara dati per il plotting
+geq <- geq[geq[, 1] %in% cor_gene_list, ]
+meth <- meth[meth[, 1] %in% cor_gene_list, ]
+
+geq_long <- pivot_longer(geq, cols = -1, names_to = "Campione", values_to = "Espressione")
+meth_long <- pivot_longer(meth, cols = -1, names_to = "Campione", values_to = "Metilazione")
+
+merged_data <- inner_join(geq_long, meth_long, by = c("Campione", "gene_symbol"))
+merged_data$Tipo <- ifelse(grepl("normal", merged_data$Campione), "Normal", "Tumoral")
+
+# Plotta ogni gene con ρ e p-value adjusted
+for (gene in unique(merged_data$gene_symbol)) {
+  data_gene <- subset(merged_data, gene_symbol == gene)
+  stats_gene <- spearman_results_filtrata %>% filter(gene == !!gene)
+  rho <- stats_gene$correlation
+  pval_adj <- stats_gene$p_value_adj
+  
+  p <- ggplot(data_gene, aes(x = Metilazione, y = Espressione)) +
+    geom_point(aes(color = Tipo), alpha = 0.7) +
+    geom_smooth(method = "lm", se = FALSE, color = "gray30", linetype = "dashed") +
+    labs(
+      x = "Metilazione",
+      y = "Espressione",
+      title = paste("Gene:", gene)
+    ) +
+    scale_color_manual(values = c("Normal" = "#800020", "Tumoral" = "#006994")) +
+    theme_minimal() +
+    annotate("text",
+             x = min(data_gene$Metilazione, na.rm = TRUE),
+             y = max(data_gene$Espressione, na.rm = TRUE),
+             label = paste("ρ =", round(rho, 3), ", nFDR =", signif(pval_adj, 3)),
+             hjust = 0, vjust = 1, size = 5, color = "black")
+  
+  ggsave(filename = file.path("plot correlazione/", paste0(gene, "_spearman.png")),
+         plot = p, width = 6, height = 4)
+}
+
+
+# --- PANNELLI DI PLOT ---
+
+# Split tra geni positivi e negativi
+geq_pos <- geq[geq[, 1] %in% genes_pos, ]
+meth_pos <- meth[meth[, 1] %in% genes_pos, ]
+geq_neg <- geq[geq[, 1] %in% genes_neg, ]
+meth_neg <- meth[meth[, 1] %in% genes_neg, ]
+
+# Converti in formato lungo
+geq_pos_long <- pivot_longer(geq_pos, cols = -1, names_to = "Campione", values_to = "Espressione", names_transform = list(Campione = as.character))
+meth_pos_long <- pivot_longer(meth_pos, cols = -1, names_to = "Campione", values_to = "Metilazione", names_transform = list(Campione = as.character))
+
+geq_neg_long <- pivot_longer(geq_neg, cols = -1, names_to = "Campione", values_to = "Espressione", names_transform = list(Campione = as.character))
+meth_neg_long <- pivot_longer(meth_neg, cols = -1, names_to = "Campione", values_to = "Metilazione", names_transform = list(Campione = as.character))
+
+# Rinomina colonna dei geni
+colnames(geq_pos_long)[1] <- "gene_symbol"
+colnames(meth_pos_long)[1] <- "gene_symbol"
+colnames(geq_neg_long)[1] <- "gene_symbol"
+colnames(meth_neg_long)[1] <- "gene_symbol"
+
+# Join positivi
+merged_data_pos <- inner_join(geq_pos_long, meth_pos_long, by = c("Campione", "gene_symbol"))
+merged_data_pos$Tipo <- ifelse(grepl("normal", merged_data_pos$Campione), "Normal", "Tumoral")
+
+# Join negativi
+merged_data_neg <- inner_join(geq_neg_long, meth_neg_long, by = c("Campione", "gene_symbol"))
+merged_data_neg$Tipo <- ifelse(grepl("normal", merged_data_neg$Campione), "Normal", "Tumoral")
+
+# Plot per positivi
+plots_pos <- list()
+for (gene in unique(merged_data_pos$gene_symbol)) {
+  data_gene <- subset(merged_data_pos, gene_symbol == gene)
+  spearman_cor <- cor(data_gene$Metilazione, data_gene$Espressione, method = "spearman", use = "complete.obs")
+  fdr_val <- spearman_results_filtrata$p_value_adj[spearman_results_filtrata$gene == gene]
+  
+  p <- ggplot(data_gene, aes(x = Metilazione, y = Espressione)) +
+    geom_point(data = subset(data_gene, Tipo == "Tumoral"), aes(color = Tipo), alpha = 0.6) +
+    geom_point(data = subset(data_gene, Tipo == "Normal"), aes(color = Tipo)) +
+    geom_smooth(method = "lm", se = FALSE, color = "gray30", linetype = "dashed") +
+    labs(x = "Metilazione", y = "Espressione", title = paste("Gene:", gene)) +
+    scale_color_manual(values = c("Normal" = "#800020", "Tumoral" = "#006994")) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 18, face = "bold")) +
+    annotate("text", x = min(data_gene$Metilazione, na.rm = TRUE), 
+             y = max(data_gene$Espressione, na.rm = TRUE), 
+             label = paste0("ρ = ", round(spearman_cor, 3), 
+                            ", FDR = ", signif(fdr_val, 3)), 
+             hjust = 0, vjust = 1, size = 4, color = "black")
+  
+  plots_pos[[gene]] <- p
+}
+
+# Plot per negativi
+plots_neg <- list()
+for (gene in unique(merged_data_neg$gene_symbol)) {
+  data_gene <- subset(merged_data_neg, gene_symbol == gene)
+  spearman_cor <- cor(data_gene$Metilazione, data_gene$Espressione, method = "spearman", use = "complete.obs")
+  fdr_val <- spearman_results_filtrata$p_value_adj[spearman_results_filtrata$gene == gene]
+  
+  p <- ggplot(data_gene, aes(x = Metilazione, y = Espressione)) +
+    geom_point(data = subset(data_gene, Tipo == "Tumoral"), aes(color = Tipo), alpha = 0.6) +
+    geom_point(data = subset(data_gene, Tipo == "Normal"), aes(color = Tipo)) +
+    geom_smooth(method = "lm", se = FALSE, color = "gray30", linetype = "dashed") +
+    labs(x = "Metilazione", y = "Espressione", title = paste("Gene:", gene)) +
+    scale_color_manual(values = c("Normal" = "#800020", "Tumoral" = "#006994")) +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 18, face = "bold")) +
+    annotate("text", x = min(data_gene$Metilazione, na.rm = TRUE), 
+             y = max(data_gene$Espressione, na.rm = TRUE), 
+             label = paste0("ρ = ", round(spearman_cor, 3), 
+                            ", FDR = ", signif(fdr_val, 3)), 
+             hjust = 0, vjust = 1, size = 4, color = "black")
+  
+  plots_neg[[gene]] <- p
+}
+
+
+# Unisci i plot in un pannello per i geni con correlazione positiva
+grid.arrange(grobs = plots_pos, ncol = 3)
+#salva manualmente il plot
+
+# Unisci i plot in un pannello per i geni con correlazione negativa
+grid.arrange(grobs = plots_neg, ncol = 3)
+#salva manualmente il plot
